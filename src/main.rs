@@ -31,7 +31,7 @@ where
         .about(
             "Encrypt a file with the provided key. \
             The output will include the encrypted payload, authentication tag, and by default \
-            the nonce used.",
+            the nonce used appended as the final 24 bytes.",
         )
         .arg(
             Arg::with_name("use-nonce")
@@ -54,6 +54,17 @@ where
                 .value_name("path"),
         )
         .arg(
+            Arg::with_name("input")
+                .long("input")
+                .short("i")
+                .help(
+                    "Specifies the path to read the input payload from. \
+                      Defaults to STDIN. Use - to refer to STDIN",
+                )
+                .takes_value(true)
+                .value_name("path"),
+        )
+        .arg(
             Arg::with_name("key")
                 .help(
                     "File to read the key from. Defaults to STDIN. \
@@ -65,7 +76,44 @@ where
                 .required(true)
                 .value_name("path"),
         );
-    let decrypt = SubCommand::with_name("decrypt").about("Decrypt a file with the provided key");
+    let decrypt = SubCommand::with_name("decrypt")
+        .about(
+            "Decrypt a file with the provided key. By default, the last 24 bytes of the input
+            is assumed to be the nonce. This is the default output from the `encrypt` subcommand.",
+        )
+        .arg(
+            Arg::with_name("input")
+                .long("input")
+                .short("i")
+                .help(
+                    "Specifies the path to read the input payload from. \
+                      Defaults to STDIN. Use - to refer to STDIN",
+                )
+                .takes_value(true)
+                .value_name("path"),
+        )
+        .arg(
+            Arg::with_name("use-nonce")
+                .long("use-nonce")
+                .help(
+                    "Instead of reading the nonce from the final 24 bytes of the input, \
+                     read it from the path provided instead. Use - to refer to STDIN",
+                )
+                .takes_value(true)
+                .value_name("path"),
+        )
+        .arg(
+            Arg::with_name("key")
+                .help(
+                    "File to read the key from. Defaults to STDIN. \
+                    Use `-` to refer to STDIN",
+                )
+                .short("k")
+                .long("key")
+                .takes_value(true)
+                .required(true)
+                .value_name("path"),
+        );
     let gen_key = SubCommand::with_name("gen-key").about(
         "Generate a key for use with encryption or decryption",
     );
@@ -145,6 +193,26 @@ fn run_subcommand(args: &ArgMatches) -> Result<(), String> {
             };
             encrypt(key, input, output, use_nonce, write_nonce)
         }
+        ("decrypt", Some(args)) => {
+            let input = args.value_of("input").or_else(|| Some("-"));
+            let key = args.value_of("key").or_else(|| Some("-"));
+            let output = args.value_of("output").or_else(|| Some("-"));
+
+            let use_nonce = args.value_of("use-nonce");
+
+            if dash_count([key.clone(), input.clone(), use_nonce.clone()].iter()) > 1 {
+                Err("Only one input source can be from STDIN")?
+            }
+
+            let input = input_reader(input.unwrap())?; // safe to unwrap
+            let output = output_writer(output.unwrap())?; // safe to unwrap
+            let key = input_reader(key.unwrap())?; // safe to unwrap
+            let use_nonce = match use_nonce {
+                None => None,
+                Some(path) => Some(input_reader(path)?),
+            };
+            decrypt(key, input, output, use_nonce)
+        }
         _ => Err("Unknown command or missing options".to_string()),
     }
 }
@@ -206,6 +274,57 @@ where
         None => output.write_all(&nonce.0),
         Some(mut writer) => writer.write_all(&nonce.0),
     }.map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+fn decrypt<R1, R2, R3, W>(
+    mut key: R1,
+    mut input: R2,
+    mut output: W,
+    use_nonce: Option<R3>,
+) -> Result<(), String>
+where
+    R1: Read,
+    R2: Read,
+    R3: Read,
+    W: Write,
+{
+    let key = {
+        let mut key_bytes = Vec::new();
+        let _ = key.read_to_end(&mut key_bytes).map_err(|e| e.to_string())?;
+        secretbox::Key::from_slice(&key_bytes).ok_or_else(
+            || "Incorrect length for key provided",
+        )?
+    };
+
+    let mut payload = Vec::new();
+    let _ = input.read_to_end(&mut payload).map_err(|e| e.to_string())?;
+
+    let (payload_slice, nonce) = match use_nonce {
+        Some(mut reader) => {
+            let mut buffer = Vec::new();
+            let _ = reader.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+            let nonce = secretbox::Nonce::from_slice(&buffer).ok_or_else(
+                || "Incorrect length for nonce provided",
+            )?;
+            (payload.as_slice(), nonce)
+        }
+        None => {
+            let payload_length = payload.len() - secretbox::NONCEBYTES;
+            let (payload_slice, nonce_slice) = payload.split_at(payload_length);
+            let nonce = secretbox::Nonce::from_slice(nonce_slice).ok_or_else(
+                || "Incorrect length for nonce provided",
+            )?;
+            (payload_slice, nonce)
+        }
+    };
+
+    let decrypted = secretbox::open(payload_slice, &nonce, &key).map_err(|_| {
+        "Error decrypting input".to_string()
+    })?;
+
+    let _ = output.write_all(&decrypted).map_err(|e| e.to_string())?;
 
     Ok(())
 }
