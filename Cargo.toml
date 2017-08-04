@@ -1,0 +1,8 @@
+[package]
+name = "naoh"
+version = "0.1.0"
+authors = ["Yong Wen Chua <me@yongwen.xyz>"]
+
+[dependencies]
+clap = "2.26.0"
+sodiumoxide = "0.0.15"
